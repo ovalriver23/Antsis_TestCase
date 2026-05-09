@@ -1,0 +1,50 @@
+# InvenTree ve bağımlı servislerin tanımlandığı Docker Compose dosyası
+
+services:
+
+  # PostgreSQL veritabanı servisi
+  inventree-db:
+    image: postgres:16
+    container_name: inventree-db
+    environment:
+      POSTGRES_DB: ${INVENTREE_DB_NAME}
+      POSTGRES_USER: ${INVENTREE_DB_USER}
+      POSTGRES_PASSWORD: ${INVENTREE_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # InvenTree ana uygulama servisi
+  server:
+    image: inventree/inventree:stable
+    container_name: inventree-server
+    depends_on:
+      - inventree-db
+    env_file:
+      - .env
+    volumes:
+      - inventree-data:${INVENTREE_EXT_VOLUME}
+      - ./plugin/material_check:/home/inventree/plugins/material_check
+    ports:
+      - ${INVENTREE_WEB_PORT}:8000
+    restart: unless-stopped
+
+  # Arka plan işleri için worker servisi
+  worker:
+    image: inventree/inventree:stable
+    container_name: inventree-worker
+    command: invoke worker
+    depends_on:
+      - inventree-db
+      - server
+    env_file:
+      - .env
+    volumes:
+      - inventree-data:${INVENTREE_EXT_VOLUME}
+      - ./plugin/material_check:/home/inventree/plugins/material_check
+    restart: unless-stopped
+
+# Kalıcı veri depolama alanları
+volumes:
+  pgdata:
+  inventree-data:
