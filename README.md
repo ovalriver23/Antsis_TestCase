@@ -7,7 +7,7 @@
 - [Kurulum](#kurulum)
 - [Eklentiyi aktif etme](#eklentiyi-aktif-etme)
 - [Ayarlar](#ayarlar)
-- [Test verisi ve demo](#test-verisi-ve-demo) *(yakında)*
+- [Test verisi ve demo](#test-verisi-ve-demo)
 - [Tasarım kararları](#tasarım-kararları) *(yakında)*
 
 ---
@@ -18,11 +18,11 @@ Bir üretim emri (Build Order) oluşturduğunda, bu eklenti otomatik olarak şun
 
 > "Bu ürünü üretmek için gereken tüm malzemeler stokta var mı?"
 
-E�er eksik malzeme varsa seni hemen uyarır.
+Eğer eksik malzeme varsa seni hemen uyarır — ya bir hata göstererek order'ı bloklar, ya da order'ı oluşturup eksik listesini Build Order'ın notlarına ekler.
 
 ### Neden lazım?
 
-Diyelim ki 20 adet PCB kartı üretmek istiyorsun. Üretim başladıktan sonra bir malzemenin stokta olmadığını fark edersen iş işten geçmiş olur. Bu eklenti, üretim emri oluşturulur oluşturulmaz seni uyarır.
+Diyelim ki 20 adet PCB kartı üretmek istiyorsun. Üretim başladıktan sonra bir malzemenin stokta olmadığını fark edersen iş işten geçmiş olur. Bu eklenti, üretim emri kaydedildiği an seni uyarır.
 
 ### Örnek senaryo
 
@@ -40,43 +40,43 @@ Eklenti hemen devreye girer ve **C1 ile MCU1'in yetersiz olduğunu** sana bildir
 
 ## Nasıl çalışır?
 
+Plugin iki ayrı InvenTree mekanizmasını birden kullanır:
+
+- **ValidationMixin** → Build Order kaydedilmeden ÖNCE çalışır. Error modunda eksik varsa order'ı bloklar.
+- **EventMixin** → Build Order kaydedildikten SONRA çalışır. Warning modunda Build Order'ın notes alanına eksik raporu yazar.
+
 ### Genel akış
 
 ```
 Sen bir üretim emri kaydedersin
         │
-        ▼
-InvenTree, plugin'e "validate eder misin?" der
+        ├──── ÖNCE: ValidationMixin tetiklenir
+        │         │
+        │         ├── Mod: Error → eksik varsa BLOKLA, kaydetme
+        │         └── Mod: Warning → bir şey yapma, devam et
         │
         ▼
-Eklenti devreye girer
+   InvenTree order'ı kaydeder
         │
-        ▼
-Ürünün BOM'unu okur (hangi malzemeden kaç tane lazım)
-        │
-        ▼
-Her malzeme için hesaplama yapar:
-    lazım olan     = bom miktarı × üretim miktarı
-    kullanılabilir = stok miktarı - başka emirlere ayrılan miktar
-    eksik          = lazım olan - kullanılabilir
-        │
-        ▼
-Eksik var mı?
-    ├── HAYIR → Order kaydedilir
-    └── EVET  → Ayara bakar
-                ├── Uyarı modu → Order kaydedilir + log + üretim emrine not
-                └── Hata modu  → Order kaydedilmez, kullanıcıya hata gösterilir
+        └──── SONRA: EventMixin tetiklenir (build_build.created event'i)
+                  │
+                  ├── Mod: Error → zaten bloklandı, buraya gelmez
+                  └── Mod: Warning → eksik varsa Notes alanına yaz
 ```
 
-### Tasarım kararları
+### Eksik hesaplama formülü
 
-| Ayar | Default | Değiştirilebilir | Açıklama |
-|------|---------|:----------------:|----------|
-| Kontrol aktif/pasif | Aktif | ✅ | Eklentiyi tamamen kapatıp açabilirsin |
-| Kontrol modu | Uyarı | ✅ | Uyarı: order kaydedilir ama bilgilendirilirsin. Hata: order kaydedilmez |
-| Negatif stok | İzin verilmez | ✅ | Stok miktarı 0'ın altına düşemez |
-| Ayrılmış stok | Hesaba katılır | ✅ | Başka emirlere ayrılan malzeme kullanılabilir stoktan düşülür |
-| UI bildirimi | Yok | — | Gerekirse sonradan eklenebilir |
+Her BOM item için:
+
+```
+required     = bom miktarı × üretim miktarı
+available    = (USE_ALLOCATED_STOCK açıksa) stok - ayrılmış stok
+               (USE_ALLOCATED_STOCK kapalıysa) toplam stok
+available    = (ALLOW_NEGATIVE_STOCK kapalıysa) max(available, 0)
+shortage     = required - available
+```
+
+`shortage > 0` olanlar eksik listesine girer.
 
 ---
 
@@ -155,17 +155,30 @@ Admin bilgileriyle giriş yap:
 
 ## Eklentiyi aktif etme
 
-Plugin sistem üzerinde otomatik tanınır ama varsayılan olarak **pasif** durumdadır. Aktif etmek için:
+Plugin sistem üzerinde otomatik tanınır ama varsayılan olarak **pasif** durumdadır. Aktif etmek için 3 adımı tamamlaman gerekir.
 
-**1.** InvenTree arayüzünde sağ üstten **Admin Center**'a git
+### 1. Plugin'i aktif et
 
-**2.** Sol menüden **Plugins** sekmesine geç
+- **Admin Center → Plugins** sayfasına git
+- Listeden **MaterialCheckPlugin** satırını bul, üstüne tıkla
+- Açılan panelde **Active** toggle'ını aç
 
-**3.** Listeden **MaterialCheckPlugin** satırını bul
+### 2. InvenTree'nin event sistemini aç (önemli!)
 
-**4.** Üstüne tıkla, açılan panelde **Active** toggle'ını aç
+Warning modunun çalışması için InvenTree'nin global event entegrasyonu açık olmalı. Bu varsayılan olarak kapalıdır.
 
-Plugin aktif olduktan sonra Build Order kaydederken otomatik devreye girer.
+- **Admin Center → Plugins** üst kısmındaki ayarlarda
+- **Enable Event Integration** toggle'ını aç
+
+> Bu ayarı açmazsan, **Warning modu çalışmaz** (eksik raporu Notes alanına yazılmaz). Error modu yine çalışır çünkü o validation üzerinden gider.
+
+### 3. Servisleri yeniden başlat
+
+```bash
+docker compose restart server worker
+```
+
+Artık plugin Build Order kaydedildiğinde otomatik devreye girer.
 
 ---
 
@@ -176,10 +189,70 @@ Plugin detay sayfasında **Plugin Settings** bölümünde 4 ayar bulunur:
 | Ayar | Tip | Default | Ne yapar? |
 |------|-----|---------|-----------|
 | **Enable Check** | Açık/Kapalı | Açık | Plugin'in çalışıp çalışmayacağını kontrol eder. Kapalıysa stok kontrolü hiç yapılmaz. |
-| **Check Mode** | Seçim | Warning | Eksik malzeme bulununca ne olacağını belirler. **Warning:** order kaydedilir, kullanıcı bilgilendirilir. **Error:** order kaydedilmez, hata gösterilir. |
-| **Allow Negative Stock** | Açık/Kapalı | Kapalı | Stok miktarının 0'ın altına düşmesine izin verilip verilmeyeceği. Kapalıyken hiçbir malzeme negatif olarak değerlendirilmez. |
+| **Check Mode** | Seçim | Warning | Eksik malzeme bulununca ne olacağını belirler. **Warning:** order kaydedilir, eksikler Notes alanına yazılır. **Error:** order kaydedilmez, ekrana hata mesajı çıkar. |
+| **Allow Negative Stock** | Açık/Kapalı | Kapalı | Stok miktarının 0'ın altına düşmesine izin verilip verilmeyeceği. Açıkken negatif stok olduğu gibi hesaba katılır (örn: stok -5 ve lazım 100 ise eksik 105 hesaplanır). Kapalıyken negatif değerler 0 olarak kabul edilir. |
 | **Consider Allocated Stock** | Açık/Kapalı | Açık | Başka Build Order'lara ayrılmış (allocated) stoğun hesaba katılıp katılmayacağı. Açıkken kullanılabilir stok = toplam stok - ayrılmış stok. |
 
 ---
 
-*Aşağıdaki bölümler ilerledikçe doldurulacak.*
+## Test verisi ve demo
+
+Plugin'in çalışmasını test etmek için aşağıdaki demo verisini hazırlayabilirsin.
+
+### 1. Parçaları oluştur
+
+**Parts** sayfasından `+` ile yeni parçalar ekle:
+
+| Parça | Description | Assembly | Stok |
+|-------|-------------|:--------:|-----:|
+| R1 | Resistor 10 ohm | Kapalı | 500 |
+| C1 | Capacitor 10uF | Kapalı | 80 |
+| MCU1 | Microcontroller | Kapalı | 0 |
+| PCB Board | Üretilen kart | **Açık** | — |
+
+> **Not:** PCB Board'un Assembly toggle'ını AÇMAYI unutma. Aksi halde BOM ekleyemezsin.
+
+### 2. PCB Board için BOM oluştur
+
+PCB Board → **Bill of Materials** sekmesi → `+` butonu ile şunları ekle:
+
+| Component | Quantity |
+|-----------|---------:|
+| R1 | 10 |
+| C1 | 5 |
+| MCU1 | 1 |
+
+### 3. Build Order oluştur
+
+**Manufacturing → Build Orders → +** ile:
+- Part: PCB Board
+- Quantity: 20
+
+### 4. Beklenen sonuçlar
+
+**Warning modunda** (default):
+- Order kaydedilir
+- Order detay sayfasında **Notes** sekmesinde şu rapor görünür:
+
+```
+Build Order #X — Eksik malzemeler:
+  - C1: lazım 100, stokta 80, eksik 20
+  - MCU1: lazım 20, stokta 0, eksik 20
+```
+
+**Error modunda**:
+- Plugin ayarlarından **Check Mode → Error** yap
+- Build Order kaydetmeye çalış
+- Ekranda kırmızı bir Form Error kutusu çıkar:
+
+```
+Build Order #X — Eksik malzemeler:
+  - C1: lazım 100, stokta 80, eksik 20
+  - MCU1: lazım 20, stokta 0, eksik 20
+```
+
+- Order **kaydedilmez**
+
+---
+
+*Tasarım kararları bölümü ilerledikçe doldurulacak.*

@@ -1,6 +1,6 @@
 # InvenTree'nin temel plugin class'ları ve mixin'leri
 from plugin import InvenTreePlugin
-from plugin.mixins import ValidationMixin, SettingsMixin
+from plugin.mixins import ValidationMixin, SettingsMixin, EventMixin
 
 import logging
 
@@ -8,7 +8,7 @@ import logging
 logger = logging.getLogger("inventree")
 
 
-class MaterialCheckPlugin(ValidationMixin, SettingsMixin, InvenTreePlugin):
+class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, InvenTreePlugin):
     """
     Build Order kaydedilirken BOM'daki malzemelerin
     stok yeterliliğini kontrol eden plugin.
@@ -52,47 +52,28 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, InvenTreePlugin):
         },
     }
 
-    def validate_model_instance(self, instance, deltas=None):
+    # ----------------------------------------------------------------------
+    # Yardımcı method: Build Order için eksik malzemeleri hesaplar
+    # Hem validation hem event tarafında kullanılır
+    # ----------------------------------------------------------------------
+    def _calculate_shortages(self, instance):
         """
-        InvenTree her model kaydedilirken bu method'u çağırır.
-        Biz sadece Build Order'ları kontrol ediyoruz.
+        Verilen Build Order için BOM'u tarar ve eksik parça listesini döner.
+        Eksik yoksa boş liste döner.
         """
-
-        # Build modelini içeride import et (Django startup'ta sorun çıkarmamak için)
-        from build.models import Build
-
-        # Sadece Build Order'ları kontrol et, diğer modelleri yoksay
-        if not isinstance(instance, Build):
-            return
-
-        # Kontrol kapalıysa hiçbir şey yapma
-        if not self.get_setting("CHECK_ENABLED"):
-            return
-
-        # Build Order'ın hedef ürünü ve miktarı
-        part = instance.part
-        build_quantity = instance.quantity
-
-        logger.warning(f"MaterialCheckPlugin: Build Order #{instance.pk} — {part.name} x {build_quantity} kontrol ediliyor...")
-
-        # Bu ürünün BOM'unu oku
-        bom_items = part.bom_items.all()
-
-        # Eksik parçaları bu listeye toplayacağız
         shortages = []
 
-        # Her BOM item için stok kontrolü yap
-        for bom_item in bom_items:
+        # Bu ürünün BOM'unu oku
+        bom_items = instance.part.bom_items.all()
 
+        for bom_item in bom_items:
             # Toplam lazım olan = birim başına miktar × üretim miktarı
-            required = int(bom_item.quantity * build_quantity)
+            required = int(bom_item.quantity * instance.quantity)
 
             # Kullanılabilir stoku ayara göre hesapla
             if self.get_setting("USE_ALLOCATED_STOCK"):
-                # Allocated stock düşülmüş, gerçek kullanılabilir miktar
                 available = int(bom_item.sub_part.available_stock)
             else:
-                # Ham stok, allocated stock hesaba katılmaz
                 available = int(bom_item.sub_part.total_stock)
 
             # Negatif stoka izin yoksa 0 alt sınır uygula
@@ -100,9 +81,9 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, InvenTreePlugin):
                 available = max(available, 0)
 
             # Eksik miktarı hesapla
-            shortage = max(required - available, 0)
+            shortage = required - available
 
-            # Eksik varsa listeye ekle
+            # Sadece eksik olanları listele
             if shortage > 0:
                 shortages.append({
                     "part": bom_item.sub_part.name,
@@ -111,27 +92,92 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, InvenTreePlugin):
                     "shortage": shortage,
                 })
 
-        # Eksik yoksa dur, hiçbir şey yapma
-        if not shortages:
-            logger.warning(f"MaterialCheckPlugin: Tüm malzemeler yeterli.")
-            return
+        return shortages
 
-        # Eksik raporu oluştur
-        report_lines = [f"Build Order #{instance.pk} — Eksik malzemeler:"]
+    # ----------------------------------------------------------------------
+    # Yardımcı method: Eksik listesini okunabilir bir rapor metnine çevirir
+    # ----------------------------------------------------------------------
+    def _format_report(self, instance, shortages):
+        """Eksik listesini okunabilir bir metne çevirir."""
+        lines = [f"Build Order #{instance.pk} — Eksik malzemeler:"]
         for s in shortages:
-            report_lines.append(
+            lines.append(
                 f"  - {s['part']}: lazım {s['required']}, stokta {s['available']}, eksik {s['shortage']}"
             )
-        report = "\n".join(report_lines)
+        return "\n".join(lines)
 
-        logger.warning(f"MaterialCheckPlugin:\n{report}")
+    # ----------------------------------------------------------------------
+    # ValidationMixin: kayıt edilmeden ÖNCE çalışır, error modunda bloklar
+    # ----------------------------------------------------------------------
+    def validate_model_instance(self, instance, deltas=None):
+        """
+        Build Order kaydedilmeden önce çalışır.
+        Error modunda eksik varsa kaydı bloklar.
+        """
+        from build.models import Build
 
-        # Ayara göre karar ver
-        if self.get_setting("CHECK_MODE") == "error":
-            # Hata modu: order kaydedilmez
-            self.raise_error(report)
-        else:
-            # Uyarı modu: order kaydedilir, sadece log yazılır
-            # Not: Build Order'a note eklemek için instance.pk lazım
-            # instance henüz kaydedilmediği için pk olmayabilir, bu yüzden sadece log yazıyoruz
-            pass
+        # Sadece Build Order'ları kontrol et
+        if not isinstance(instance, Build):
+            return
+
+        if not self.get_setting("CHECK_ENABLED"):
+            return
+
+        # Sadece error modunda bloklamak için kontrol yap
+        # Warning modu event tarafında çalışır
+        if self.get_setting("CHECK_MODE") != "error":
+            return
+
+        shortages = self._calculate_shortages(instance)
+        if not shortages:
+            return
+
+        # Eksik var ve error modu açık — bloklayarak hata fırlat
+        report = self._format_report(instance, shortages)
+        logger.warning(f"MaterialCheckPlugin (BLOCKED):\n{report}")
+        self.raise_error(report)
+
+    # ----------------------------------------------------------------------
+    # EventMixin: kayıt edildikten SONRA çalışır, warning modunda not ekler
+    # ----------------------------------------------------------------------
+    def process_event(self, event, *args, **kwargs):
+        """
+        Build Order kaydedildikten sonra çalışır.
+        Warning modunda eksikler varsa Build Order'ın notes alanına yazar.
+        """
+        # Sadece Build Order oluşturma event'i ile ilgileniyoruz
+        if event != "build_build.created":
+            return
+
+        if not self.get_setting("CHECK_ENABLED"):
+            return
+
+        # Sadece warning modunda not yaz
+        # Error modu zaten validation tarafında çalıştı, buraya zaten gelmedi (bloklandı)
+        if self.get_setting("CHECK_MODE") != "warning":
+            return
+
+        # Build Order'ı veritabanından çek (artık kayıtlı, pk var)
+        build_id = kwargs.get("id")
+        if not build_id:
+            return
+
+        from build.models import Build
+        try:
+            instance = Build.objects.get(pk=build_id)
+        except Build.DoesNotExist:
+            return
+
+        shortages = self._calculate_shortages(instance)
+        if not shortages:
+            logger.info(f"MaterialCheckPlugin: Build Order #{instance.pk} — tüm malzemeler yeterli.")
+            return
+
+        # Eksik var, log'a yaz ve notes alanına ekle
+        report = self._format_report(instance, shortages)
+        logger.warning(f"MaterialCheckPlugin (WARNING):\n{report}")
+
+        # Build Order'ın notes alanına raporu ekle
+        existing_notes = instance.notes or ""
+        instance.notes = existing_notes + "\n\n---\n" + report
+        instance.save(update_fields=["notes"])
