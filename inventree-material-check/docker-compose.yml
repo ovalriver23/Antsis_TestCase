@@ -14,12 +14,28 @@ services:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # Tek seferlik kurulum servisi — migrate + admin kullanıcısı oluşturma
+  setup:
+    image: inventree/inventree:stable
+    container_name: inventree-setup
+    command: invoke update --no-input
+    depends_on:
+      - inventree-db
+    env_file:
+      - .env
+    volumes:
+      - inventree-data:${INVENTREE_EXT_VOLUME}
+    restart: "no"
+
   # InvenTree ana uygulama servisi
   server:
     image: inventree/inventree:stable
     container_name: inventree-server
     depends_on:
-      - inventree-db
+      setup:
+        condition: service_completed_successfully
+      inventree-db:
+        condition: service_started
     env_file:
       - .env
     volumes:
