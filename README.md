@@ -113,7 +113,7 @@ shortage     = required - available
 **1. Repoyu klonla**
 
 ```bash
-git clone https://github.com/kullanici/inventree-material-check.git
+git clone https://github.com/ovalriver23/Antsis_TestCase.git
 cd inventree-material-check
 ```
 
