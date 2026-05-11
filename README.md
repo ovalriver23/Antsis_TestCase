@@ -187,6 +187,12 @@ Plugin detay sayfasında **Plugin Settings** bölümünde 4 ayar bulunur:
 
 ## Test verisi ve demo
 
+### Demo Video
+
+[Eklentiyi canlı görmek için bu demo videoyu izleyin](https://youtu.be/AM-ts8VlMvo)
+
+---
+
 Plugin'in çalışmasını test etmek için aşağıdaki demo verisini hazırlayabilirsin.
 
 ### Senaryo 1 — Tek seviye BOM
