@@ -23,7 +23,7 @@ services:
   setup:
     image: inventree/inventree:stable
     container_name: inventree-setup
-    command: invoke update --no-input
+    command: invoke update
     depends_on:
       inventree-db:
         condition: service_healthy

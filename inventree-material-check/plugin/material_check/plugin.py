@@ -1,13 +1,18 @@
-# InvenTree'nin temel plugin class'ları ve mixin'leri
+# InvenTree'nin temel plugin class'ı ve kullanılan mixin'ler
 from plugin import InvenTreePlugin
-from plugin.mixins import ValidationMixin, SettingsMixin, EventMixin, UrlsMixin
+from plugin.mixins import (
+    ValidationMixin,  # Build Order kaydedilmeden önce stok kontrolü yapar (error modu)
+    SettingsMixin,    # Plugin ayarlarını InvenTree arayüzüne açar
+    EventMixin,       # Build Order kaydedildikten sonra note yazar (warning modu)
+    UrlsMixin,        # CSV export için özel URL endpoint'i ekler
+)
 from django.urls import path
 from django.http import HttpResponse
 import csv
 import logging
-import math
+import math  # math.ceil: gerekli miktarı her zaman yukarı yuvarla, eksik hesaplama
 
-# Bu plugin'e ait log kanalı
+# InvenTree'nin kendi log sistemiyle entegre log kanalı
 logger = logging.getLogger("inventree")
 
 
@@ -66,8 +71,10 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
 
     def export_csv(self, request, build_id):
         """
-        Verilen Build Order için eksik malzeme raporunu CSV olarak döner.
+        Verilen Build Order için eksik malzeme raporunu CSV dosyası olarak döner.
+        Erişim: /plugin/materialcheckplugin/export/<build_id>/
         """
+        # Build modeli burada import ediliyor — Django startup sırasında circular import olmaması için
         from build.models import Build
 
         try:
@@ -77,9 +84,11 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
 
         shortages = self._calculate_shortages(build)
 
+        # utf-8-sig: Excel'in Türkçe karakterleri (ş, ı, ğ vb.) doğru okuması için BOM karakteri ekler
         response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
         response["Content-Disposition"] = f'attachment; filename="build_{build_id}_shortages.csv"'
 
+        # delimiter=";": Excel varsayılan olarak ";" bekler, "," ile kolonlar ayrılmaz
         writer = csv.writer(response, delimiter=";")
         writer.writerow(["Build Order", "Part", "Required", "Available", "Shortage"])
         for s in shortages:
@@ -97,10 +106,12 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
         Aynı parça farklı seviyelerde geçerse miktarları toplanır.
         Eksik yoksa boş liste döner.
         """
-        # Önce BOM'u tara, her seviyedeki ihtiyaçları topla (aynı parça birden fazla kez gelebilir)
+        # Tüm BOM seviyelerini recursive olarak tara
+        # Aynı parça farklı sub-assembly'lerde tekrar geçebileceğinden ham liste olarak al
         raw_items = self._traverse_bom(instance.part, instance.quantity, visited=set())
 
-        # Aynı parçaları birleştir — miktarları topla
+        # Aynı parçanın birden fazla seviyede geçtiği durumda miktarları topla
+        # Örnek: R1 hem ana BOM'da hem sub-assembly BOM'unda geçiyorsa toplam ihtiyaç birleştirilir
         merged = {}
         for item in raw_items:
             name = item["part"]
@@ -109,7 +120,7 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
             else:
                 merged[name] = item.copy()
 
-        # Eksikleri yeniden hesapla (required değişti çünkü)
+        # Birleştirme sonrası toplam required değiştiği için shortage'ı yeniden hesapla
         result = []
         for item in merged.values():
             item["shortage"] = max(item["required"] - item["available"], 0)
@@ -120,11 +131,12 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
 
     def _traverse_bom(self, part, quantity, visited):
         """
-        BOM'u recursive olarak tarar.
-        - Sub-assembly ise içine girer, miktarı çarparak ilerler
-        - Leaf part ise stok kontrolü yapar
-        - visited set'i circular BOM döngüsünü önler
+        BOM ağacını recursive olarak dolaşır.
+        - sub_part.assembly == True  → bu parçanın da kendi BOM'u var, içine gir
+        - sub_part.assembly == False → hammadde, stok kontrolü yap
+        - visited set'i: A→B→A gibi döngüsel BOM tanımlarında sonsuz döngüyü önler
         """
+        # Bu parçayı daha önce ziyaret ettik — circular BOM, atla
         if part.pk in visited:
             logger.warning("MaterialCheckPlugin: Circular BOM tespit edildi — Part #%s atlandı.", part.pk)
             return []
@@ -134,21 +146,28 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
 
         for bom_item in part.bom_items.all():
             sub_part = bom_item.sub_part
+            # Her seviyede miktar çarpılarak aşağı aktarılır
+            # Örnek: Ana BOM'da 2 adet Sub-Assembly, Sub-Assembly'de 5 adet R1 → 10 adet R1 gerekli
             required_quantity = bom_item.quantity * quantity
 
             if sub_part.assembly:
-                # Sub-assembly: recursive olarak içine gir
+                # Sub-assembly: kendi BOM'unu çözmek için recursive çağrı
                 sub_shortages = self._traverse_bom(sub_part, required_quantity, visited)
                 shortages.extend(sub_shortages)
             else:
-                # Leaf part: stok kontrolü yap
+                # Hammadde: stok kontrolü yap
+                # math.ceil: 0.5 birim × 3 adet = 1.5 → 2 alınmalı, hiçbir zaman eksik hesaplama yapma
                 required = math.ceil(required_quantity)
 
                 if self.get_setting("USE_ALLOCATED_STOCK"):
+                    # Başka emirlere ayrılmış stok düşülmüş, gerçek kullanılabilir miktar
                     available = int(sub_part.available_stock)
                 else:
+                    # Ham stok, ayrılmış stok hesaba katılmaz
                     available = int(sub_part.total_stock)
 
+                # ALLOW_NEGATIVE_STOCK kapalıysa, negatif stoku 0 say
+                # Açıksa negatif değer olduğu gibi kalır ve daha büyük eksik hesaplanır
                 if not self.get_setting("ALLOW_NEGATIVE_STOCK"):
                     available = max(available, 0)
 
@@ -168,27 +187,33 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
     # Yardımcı method: Build Order notuna raporu yazar veya günceller
     # ----------------------------------------------------------------------
 
+    # Build Order notunda plugin'in yazdığı bloğu bulmak için marker'lar
+    # Her güncelleme aynı bloğu bulup yerinde değiştirir — kullanıcının kendi notlarına dokunmaz
     NOTE_START = "--- MATERIAL CHECK START ---"
     NOTE_END   = "--- MATERIAL CHECK END ---"
 
     def _write_note(self, instance, report):
         """
-        Raporu Build Order notuna yazar.
-        Önceki material check bloğu varsa yerinde günceller, yoksa sona ekler.
+        Raporu Build Order'ın notes alanına yazar.
+        - İlk kez yazılıyorsa mevcut notların sonuna ekler
+        - Daha önce yazılmışsa START/END marker'ları arasındaki bloğu günceller
         """
-        existing = instance.notes or ""
+        existing  = instance.notes or ""
         new_block = f"{self.NOTE_START}\n{report}\n{self.NOTE_END}"
 
         if self.NOTE_START in existing:
-            # Önceki raporu bul ve değiştir
+            # Önceki raporu marker'larla bul ve yerinde değiştir
+            # Bu sayede Build Order her güncellendiğinde rapor birikmez, sadece güncellenir
             start = existing.index(self.NOTE_START)
             end   = existing.index(self.NOTE_END) + len(self.NOTE_END)
             instance.notes = existing[:start] + new_block + existing[end:]
         else:
-            # İlk kez yazılıyor, sona ekle
+            # İlk kez yazılıyor — mevcut not varsa araya boşluk koy, yoksa direkt yaz
             separator = "\n\n" if existing.strip() else ""
             instance.notes = existing + separator + new_block
 
+        # update_fields ile sadece notes alanı kaydedilir
+        # Böylece başka field'lara bağlı signal'lar gereksiz yere tetiklenmez
         instance.save(update_fields=["notes"])
         logger.info("MaterialCheckPlugin: Build Order #%s notu güncellendi.", instance.pk)
 
@@ -209,20 +234,22 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
     # ----------------------------------------------------------------------
     def validate_model_instance(self, instance, deltas=None):
         """
-        Build Order kaydedilmeden önce çalışır.
-        Error modunda eksik varsa kaydı bloklar.
+        InvenTree her model kaydedilmeden önce bu method'u çağırır.
+        Sadece error modunda aktif — eksik malzeme varsa Build Order'ın kaydedilmesini engeller.
+        Warning modu buraya girmez, o EventMixin tarafında çalışır.
         """
+        # Build modeli burada import ediliyor — Django startup sırasında circular import olmaması için
         from build.models import Build
 
-        # Sadece Build Order'ları kontrol et
+        # ValidationMixin tüm modeller için tetiklenir — sadece Build Order'larla ilgileniyoruz
         if not isinstance(instance, Build):
             return
 
         if not self.get_setting("CHECK_ENABLED"):
             return
 
-        # Sadece error modunda bloklamak için kontrol yap
-        # Warning modu event tarafında çalışır
+        # Error modunda: kayıt bloklanır
+        # Warning modunda: kayıt geçer, note EventMixin tarafında yazılır
         if self.get_setting("CHECK_MODE") != "error":
             return
 
@@ -230,21 +257,26 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
         if not shortages:
             return
 
-        # Eksik var ve error modu açık — bloklayarak hata fırlat
         report = self._format_report(instance, shortages)
-        logger.warning(f"MaterialCheckPlugin (BLOCKED):\n{report}")
+        logger.warning("MaterialCheckPlugin (BLOCKED):\n%s", report)
+        # raise_error → ValidationMixin'in kendi wrapper'ı, Django ValidationError fırlatır
         self.raise_error(report)
 
     # ----------------------------------------------------------------------
     # EventMixin: kayıt edildikten SONRA çalışır, warning modunda not ekler
     # ----------------------------------------------------------------------
 
+    # process_event'in dinleyeceği event'ler
+    # "created" → yeni Build Order oluşturuldu
+    # "saved"   → mevcut Build Order güncellendi (miktar değişikliği gibi)
+    # Her ikisinde de stok kontrolü tekrarlanır, note güncellenir
     TRACKED_EVENTS = {"build_build.created", "build_build.saved"}
 
     def process_event(self, event, *args, **kwargs):
         """
-        Build Order oluşturulduğunda veya güncellendiğinde çalışır.
-        Warning modunda eksikler varsa Build Order notunu yazar/günceller.
+        Build Order DB'ye kaydedildikten SONRA tetiklenir.
+        Bu noktada instance.pk kesinlikle mevcuttur, Build Order notuna yazılabilir.
+        Warning modunda eksikler varsa log'a yazar ve notes alanını günceller.
         """
         if event not in self.TRACKED_EVENTS:
             return
@@ -252,9 +284,11 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
         if not self.get_setting("CHECK_ENABLED"):
             return
 
+        # Error modunda bu kod hiç çalışmaz — order zaten validate_model_instance'da bloklandı
         if self.get_setting("CHECK_MODE") != "warning":
             return
 
+        # Event kwargs içinde Build Order'ın pk'si gelir
         build_id = kwargs.get("id")
         if not build_id:
             return
@@ -271,6 +305,9 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin,
             logger.info("MaterialCheckPlugin: Build Order #%s — tüm malzemeler yeterli.", instance.pk)
             return
 
+        # 1. Log'a yaz — InvenTree admin panelinden takip edilebilir
         report = self._format_report(instance, shortages)
         logger.warning("MaterialCheckPlugin (WARNING):\n%s", report)
+
+        # 2. Build Order notuna yaz — kullanıcı order detay sayfasından görür
         self._write_note(instance, report)
