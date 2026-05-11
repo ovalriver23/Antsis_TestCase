@@ -13,14 +13,20 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${INVENTREE_DB_USER} -d ${INVENTREE_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # Tek seferlik kurulum servisi — migrate + admin kullanıcısı oluşturma
   setup:
     image: inventree/inventree:stable
     container_name: inventree-setup
-    command: invoke update 
+    command: invoke update --no-input
     depends_on:
-      - inventree-db
+      inventree-db:
+        condition: service_healthy
     env_file:
       - .env
     volumes:
@@ -34,8 +40,6 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
-      inventree-db:
-        condition: service_started
     env_file:
       - .env
     volumes:
@@ -51,8 +55,8 @@ services:
     container_name: inventree-worker
     command: invoke worker
     depends_on:
-      - inventree-db
-      - server
+      setup:
+        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
