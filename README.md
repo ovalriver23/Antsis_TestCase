@@ -8,17 +8,21 @@
 - [Eklentiyi aktif etme](#eklentiyi-aktif-etme)
 - [Ayarlar](#ayarlar)
 - [Test verisi ve demo](#test-verisi-ve-demo)
-- [Tasarım kararları](#tasarım-kararları) *(yakında)*
+- [CSV Export](#csv-export)
+- [Unit testleri çalıştırma](#unit-testleri-çalıştırma)
+- [Tasarım kararları](#tasarım-kararları)
 
 ---
 
 ## Bu ne işe yarar?
 
-Bir üretim emri (Build Order) oluşturduğunda, bu eklenti otomatik olarak şunu sorar:
+Bir üretim emri (Build Order) oluşturduğunda veya güncellendiğinde, bu eklenti otomatik olarak şunu sorar:
 
 > "Bu ürünü üretmek için gereken tüm malzemeler stokta var mı?"
 
-Eğer eksik malzeme varsa seni hemen uyarır — ya bir hata göstererek order'ı bloklar, ya da order'ı oluşturup eksik listesini Build Order'ın notlarına ekler.
+E�er eksik malzeme varsa seni hemen uyarır — ya bir hata göstererek order'ı bloklar, ya da order'ı oluşturup eksik listesini Build Order'ın notlarına ekler.
+
+**Multi-level BOM desteği** sayesinde sadece doğrudan malzemeleri değil, alt assembly'lerin içindeki malzemeleri de kontrol eder.
 
 ### Neden lazım?
 
@@ -48,7 +52,7 @@ Plugin iki ayrı InvenTree mekanizmasını birden kullanır:
 ### Genel akış
 
 ```
-Sen bir üretim emri kaydedersin
+Sen bir üretim emri kaydeder veya güncellersin
         │
         ├──── ÖNCE: ValidationMixin tetiklenir
         │         │
@@ -58,18 +62,35 @@ Sen bir üretim emri kaydedersin
         ▼
    InvenTree order'ı kaydeder
         │
-        └──── SONRA: EventMixin tetiklenir (build_build.created event'i)
+        └──── SONRA: EventMixin tetiklenir
+                  │  (build_build.created veya build_build.saved)
                   │
                   ├── Mod: Error → zaten bloklandı, buraya gelmez
-                  └── Mod: Warning → eksik varsa Notes alanına yaz
+                  └── Mod: Warning → eksik varsa Notes alanına yaz/güncelle
 ```
+
+### Multi-level BOM desteği
+
+Plugin sadece doğrudan BOM item'larını değil, alt assembly'lerin BOM'larını da recursive olarak tarar:
+
+```
+PCB Board
+├── R1                (doğrudan kontrol edilir)
+├── C1                (doğrudan kontrol edilir)
+└── Microcontroller   (assembly → içine inilir)
+    └── Power Module  (assembly → içine inilir)
+        ├── Capacitor         (kontrol edilir)
+        └── Voltage Regulator (kontrol edilir)
+```
+
+Aynı parça birden fazla seviyede geçiyorsa miktarlar **toplanır**.
 
 ### Eksik hesaplama formülü
 
-Her BOM item için:
+Her leaf (hammadde) BOM item için:
 
 ```
-required     = bom miktarı × üretim miktarı
+required     = bom miktarı × üretim miktarı  (tüm seviyelerde çarpılarak)
 available    = (USE_ALLOCATED_STOCK açıksa) stok - ayrılmış stok
                (USE_ALLOCATED_STOCK kapalıysa) toplam stok
 available    = (ALLOW_NEGATIVE_STOCK kapalıysa) max(available, 0)
@@ -163,14 +184,15 @@ Plugin sistem üzerinde otomatik tanınır ama varsayılan olarak **pasif** duru
 - Listeden **MaterialCheckPlugin** satırını bul, üstüne tıkla
 - Açılan panelde **Active** toggle'ını aç
 
-### 2. InvenTree'nin event sistemini aç (önemli!)
+### 2. InvenTree'nin global ayarlarını aç (önemli!)
 
-Warning modunun çalışması için InvenTree'nin global event entegrasyonu açık olmalı. Bu varsayılan olarak kapalıdır.
+Warning modu ve CSV export için iki global ayarın açık olması gerekir.
 
-- **Admin Center → Plugins** üst kısmındaki ayarlarda
-- **Enable Event Integration** toggle'ını aç
+- **Admin Center → Plugins** üst kısmındaki ayarlarda şunları aç:
+  - **Enable Event Integration** → Warning modunun çalışması için
+  - **Enable URL Integration** → CSV export endpoint'inin çalışması için
 
-> Bu ayarı açmazsan, **Warning modu çalışmaz** (eksik raporu Notes alanına yazılmaz). Error modu yine çalışır çünkü o validation üzerinden gider.
+> Bu ayarları açmazsan **Warning modu** ve **CSV export** çalışmaz. Error modu yine çalışır çünkü o validation üzerinden gider.
 
 ### 3. Servisleri yeniden başlat
 
@@ -199,9 +221,9 @@ Plugin detay sayfasında **Plugin Settings** bölümünde 4 ayar bulunur:
 
 Plugin'in çalışmasını test etmek için aşağıdaki demo verisini hazırlayabilirsin.
 
-### 1. Parçaları oluştur
+### Senaryo 1 — Tek seviye BOM
 
-**Parts** sayfasından `+` ile yeni parçalar ekle:
+**Parçalar:**
 
 | Parça | Description | Assembly | Stok |
 |-------|-------------|:--------:|-----:|
@@ -210,11 +232,7 @@ Plugin'in çalışmasını test etmek için aşağıdaki demo verisini hazırlay
 | MCU1 | Microcontroller | Kapalı | 0 |
 | PCB Board | Üretilen kart | **Açık** | — |
 
-> **Not:** PCB Board'un Assembly toggle'ını AÇMAYI unutma. Aksi halde BOM ekleyemezsin.
-
-### 2. PCB Board için BOM oluştur
-
-PCB Board → **Bill of Materials** sekmesi → `+` butonu ile şunları ekle:
+**PCB Board BOM:**
 
 | Component | Quantity |
 |-----------|---------:|
@@ -222,37 +240,143 @@ PCB Board → **Bill of Materials** sekmesi → `+` butonu ile şunları ekle:
 | C1 | 5 |
 | MCU1 | 1 |
 
-### 3. Build Order oluştur
+**Build Order:** PCB Board × 20
 
-**Manufacturing → Build Orders → +** ile:
-- Part: PCB Board
-- Quantity: 20
-
-### 4. Beklenen sonuçlar
-
-**Warning modunda** (default):
-- Order kaydedilir
-- Order detay sayfasında **Notes** sekmesinde şu rapor görünür:
-
+**Beklenen sonuç:**
 ```
 Build Order #X — Eksik malzemeler:
   - C1: lazım 100, stokta 80, eksik 20
   - MCU1: lazım 20, stokta 0, eksik 20
 ```
-
-**Error modunda**:
-- Plugin ayarlarından **Check Mode → Error** yap
-- Build Order kaydetmeye çalış
-- Ekranda kırmızı bir Form Error kutusu çıkar:
-
-```
-Build Order #X — Eksik malzemeler:
-  - C1: lazım 100, stokta 80, eksik 20
-  - MCU1: lazım 20, stokta 0, eksik 20
-```
-
-- Order **kaydedilmez**
 
 ---
 
-*Tasarım kararları bölümü ilerledikçe doldurulacak.*
+### Senaryo 2 — Multi-level BOM
+
+**Parçalar:**
+
+| Parça | Description | Assembly | Stok |
+|-------|-------------|:--------:|-----:|
+| Capacitor | 100uF Capacitor | Kapalı | 50 |
+| Voltage Regulator | 5V Regulator | Kapalı | 10 |
+| Power Module | Modüler güç birimi | **Açık** | 0 |
+| Microcontroller | MCU with power | **Açık** | 0 |
+
+**Power Module BOM:**
+
+| Component | Quantity |
+|-----------|---------:|
+| Capacitor | 10 |
+| Voltage Regulator | 1 |
+
+**Microcontroller BOM:**
+
+| Component | Quantity |
+|-----------|---------:|
+| Power Module | 1 |
+
+**Build Order:** PCB Board × 20 (MCU1 yerine Microcontroller kullanılırsa)
+
+**Beklenen sonuç:** Plugin MCU'nun içindeki Power Module'e, oradan da Capacitor ve Voltage Regulator'a iner. Eksik miktarları tüm seviyeleri hesaba katarak raporlar.
+
+---
+
+### Modların test edilmesi
+
+**Warning modu (default):**
+- Order kaydedilir
+- Order detay sayfasında **Notes** sekmesinde eksik raporu görünür
+- Order tekrar güncellenirse rapor **yerinde güncellenir** (üst üste eklenmez)
+
+**Error modu:**
+- Plugin ayarlarından **Check Mode → Error** yap
+- Build Order kaydetmeye çalış
+- Ekranda kırmızı **Form Error** kutusu çıkar, order kaydedilmez
+
+---
+
+## CSV Export
+
+Herhangi bir Build Order için eksik malzeme raporunu CSV olarak indirebilirsin.
+
+### Kullanım
+
+Tarayıcıda şu URL'e git (build_id yerine order numarasını yaz):
+
+```
+http://localhost:8000/plugin/materialcheckplugin/export/<build_id>/
+```
+
+Örnek:
+
+```
+http://localhost:8000/plugin/materialcheckplugin/export/2/
+```
+
+### CSV İçeriği
+
+```
+Build Order;Part;Required;Available;Shortage
+2;C1;100;80;20
+2;MCU1;20;0;20
+```
+
+> **Not:** CSV export'un çalışması için **Enable URL Integration** ayarının açık olması gerekir.
+
+---
+
+## Unit testleri çalıştırma
+
+Plugin'in core mantığını test eden 8 unit test bulunmaktadır. Testler `plugin/material_check/tests/test_plugin.py` dosyasındadır.
+
+### Pytest kurulumu (sadece ilk seferinde)
+
+```bash
+docker compose exec server pip install pytest pytest-django --break-system-packages
+```
+
+### Testleri çalıştırma
+
+```bash
+docker compose exec -w /home/inventree/plugins/material_check/tests server pytest test_plugin.py -v
+```
+
+### Beklenen çıktı
+
+```
+test_plugin.py::test_basic_sanity PASSED
+test_plugin.py::test_no_shortage_when_stock_sufficient PASSED
+test_plugin.py::test_shortage_detected_when_stock_insufficient PASSED
+test_plugin.py::test_multiple_shortages PASSED
+test_plugin.py::test_negative_stock_clamped_to_zero_when_disallowed PASSED
+test_plugin.py::test_negative_stock_counted_when_allowed PASSED
+test_plugin.py::test_use_allocated_stock_branch PASSED
+test_plugin.py::test_use_total_stock_branch PASSED
+
+8 passed in 0.02s
+```
+
+### Test edilen senaryolar
+
+| Test | Ne kontrol eder |
+|------|-----------------|
+| `test_no_shortage_when_stock_sufficient` | Yeterli stok varsa boş liste döner |
+| `test_shortage_detected_when_stock_insufficient` | Eksik miktarı doğru hesaplanır |
+| `test_multiple_shortages` | Birden fazla eksik tespit edilebilir |
+| `test_negative_stock_clamped_to_zero_when_disallowed` | ALLOW_NEGATIVE_STOCK=False iken negatif stok 0 sayılır |
+| `test_negative_stock_counted_when_allowed` | ALLOW_NEGATIVE_STOCK=True iken negatif stok hesaba katılır |
+| `test_use_allocated_stock_branch` | USE_ALLOCATED_STOCK=True doğru branch'e gider |
+| `test_use_total_stock_branch` | USE_ALLOCATED_STOCK=False doğru branch'e gider |
+
+---
+
+## Tasarım kararları
+
+Bu plugin'i nasıl tasarladığım, hangi kararları neden aldığım ve karşılaştığım zorluklar hakkında detaylı açıklamalar için [DESIGN.md](DESIGN.md) dosyasına bakabilirsin.
+
+Özetle:
+- **İki mixin yaklaşımı** (ValidationMixin + EventMixin) çünkü ne tek başına yeterli değil
+- **Warning/Error modu** çünkü farklı kullanıcıların farklı ihtiyaçları var
+- **Notes alanı** çünkü ek UI karmaşıklığı yaratmadan kullanıcıya ulaşır
+- **Multi-level BOM** çünkü gerçek üretim senaryolarında assembly içinde assembly olabilir
+- **Helper method ayrımı** çünkü test edilebilir ve okunabilir kod için

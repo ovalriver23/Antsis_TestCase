@@ -1,14 +1,17 @@
 # InvenTree'nin temel plugin class'ları ve mixin'leri
 from plugin import InvenTreePlugin
-from plugin.mixins import ValidationMixin, SettingsMixin, EventMixin
-
+from plugin.mixins import ValidationMixin, SettingsMixin, EventMixin, UrlsMixin
+from django.urls import path
+from django.http import HttpResponse
+import csv
 import logging
+import math
 
 # Bu plugin'e ait log kanalı
 logger = logging.getLogger("inventree")
 
 
-class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, InvenTreePlugin):
+class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, UrlsMixin, InvenTreePlugin):
     """
     Build Order kaydedilirken BOM'daki malzemelerin
     stok yeterliliğini kontrol eden plugin.
@@ -53,46 +56,141 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, InvenTreeP
     }
 
     # ----------------------------------------------------------------------
+    # UrlsMixin: özel URL endpoint'leri
+    # CSV export için /plugin/materialcheckplugin/export/<build_id>/
+    # ----------------------------------------------------------------------
+    def setup_urls(self):
+        return [
+            path("export/<int:build_id>/", self.export_csv, name="export-csv"),
+        ]
+
+    def export_csv(self, request, build_id):
+        """
+        Verilen Build Order için eksik malzeme raporunu CSV olarak döner.
+        """
+        from build.models import Build
+
+        try:
+            build = Build.objects.get(pk=build_id)
+        except Build.DoesNotExist:
+            return HttpResponse("Build Order bulunamadı", status=404)
+
+        shortages = self._calculate_shortages(build)
+
+        response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
+        response["Content-Disposition"] = f'attachment; filename="build_{build_id}_shortages.csv"'
+
+        writer = csv.writer(response, delimiter=";")
+        writer.writerow(["Build Order", "Part", "Required", "Available", "Shortage"])
+        for s in shortages:
+            writer.writerow([build_id, s["part"], s["required"], s["available"], s["shortage"]])
+
+        return response
+
+    # ----------------------------------------------------------------------
     # Yardımcı method: Build Order için eksik malzemeleri hesaplar
     # Hem validation hem event tarafında kullanılır
     # ----------------------------------------------------------------------
     def _calculate_shortages(self, instance):
         """
-        Verilen Build Order için BOM'u tarar ve eksik parça listesini döner.
+        Verilen Build Order için tüm BOM seviyelerini tarar ve eksik parça listesini döner.
+        Aynı parça farklı seviyelerde geçerse miktarları toplanır.
         Eksik yoksa boş liste döner.
         """
+        # Önce BOM'u tara, her seviyedeki ihtiyaçları topla (aynı parça birden fazla kez gelebilir)
+        raw_items = self._traverse_bom(instance.part, instance.quantity, visited=set())
+
+        # Aynı parçaları birleştir — miktarları topla
+        merged = {}
+        for item in raw_items:
+            name = item["part"]
+            if name in merged:
+                merged[name]["required"] += item["required"]
+            else:
+                merged[name] = item.copy()
+
+        # Eksikleri yeniden hesapla (required değişti çünkü)
+        result = []
+        for item in merged.values():
+            item["shortage"] = max(item["required"] - item["available"], 0)
+            if item["shortage"] > 0:
+                result.append(item)
+
+        return result
+
+    def _traverse_bom(self, part, quantity, visited):
+        """
+        BOM'u recursive olarak tarar.
+        - Sub-assembly ise içine girer, miktarı çarparak ilerler
+        - Leaf part ise stok kontrolü yapar
+        - visited set'i circular BOM döngüsünü önler
+        """
+        if part.pk in visited:
+            logger.warning("MaterialCheckPlugin: Circular BOM tespit edildi — Part #%s atlandı.", part.pk)
+            return []
+
+        visited.add(part.pk)
         shortages = []
 
-        # Bu ürünün BOM'unu oku
-        bom_items = instance.part.bom_items.all()
+        for bom_item in part.bom_items.all():
+            sub_part = bom_item.sub_part
+            required_quantity = bom_item.quantity * quantity
 
-        for bom_item in bom_items:
-            # Toplam lazım olan = birim başına miktar × üretim miktarı
-            required = int(bom_item.quantity * instance.quantity)
-
-            # Kullanılabilir stoku ayara göre hesapla
-            if self.get_setting("USE_ALLOCATED_STOCK"):
-                available = int(bom_item.sub_part.available_stock)
+            if sub_part.assembly:
+                # Sub-assembly: recursive olarak içine gir
+                sub_shortages = self._traverse_bom(sub_part, required_quantity, visited)
+                shortages.extend(sub_shortages)
             else:
-                available = int(bom_item.sub_part.total_stock)
+                # Leaf part: stok kontrolü yap
+                required = math.ceil(required_quantity)
 
-            # Negatif stoka izin yoksa 0 alt sınır uygula
-            if not self.get_setting("ALLOW_NEGATIVE_STOCK"):
-                available = max(available, 0)
+                if self.get_setting("USE_ALLOCATED_STOCK"):
+                    available = int(sub_part.available_stock)
+                else:
+                    available = int(sub_part.total_stock)
 
-            # Eksik miktarı hesapla
-            shortage = required - available
+                if not self.get_setting("ALLOW_NEGATIVE_STOCK"):
+                    available = max(available, 0)
 
-            # Sadece eksik olanları listele
-            if shortage > 0:
-                shortages.append({
-                    "part": bom_item.sub_part.name,
-                    "required": required,
-                    "available": available,
-                    "shortage": shortage,
-                })
+                shortage = max(required - available, 0)
+
+                if shortage > 0:
+                    shortages.append({
+                        "part": sub_part.name,
+                        "required": required,
+                        "available": available,
+                        "shortage": shortage,
+                    })
 
         return shortages
+
+    # ----------------------------------------------------------------------
+    # Yardımcı method: Build Order notuna raporu yazar veya günceller
+    # ----------------------------------------------------------------------
+
+    NOTE_START = "--- MATERIAL CHECK START ---"
+    NOTE_END   = "--- MATERIAL CHECK END ---"
+
+    def _write_note(self, instance, report):
+        """
+        Raporu Build Order notuna yazar.
+        Önceki material check bloğu varsa yerinde günceller, yoksa sona ekler.
+        """
+        existing = instance.notes or ""
+        new_block = f"{self.NOTE_START}\n{report}\n{self.NOTE_END}"
+
+        if self.NOTE_START in existing:
+            # Önceki raporu bul ve değiştir
+            start = existing.index(self.NOTE_START)
+            end   = existing.index(self.NOTE_END) + len(self.NOTE_END)
+            instance.notes = existing[:start] + new_block + existing[end:]
+        else:
+            # İlk kez yazılıyor, sona ekle
+            separator = "\n\n" if existing.strip() else ""
+            instance.notes = existing + separator + new_block
+
+        instance.save(update_fields=["notes"])
+        logger.info("MaterialCheckPlugin: Build Order #%s notu güncellendi.", instance.pk)
 
     # ----------------------------------------------------------------------
     # Yardımcı method: Eksik listesini okunabilir bir rapor metnine çevirir
@@ -140,24 +238,23 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, InvenTreeP
     # ----------------------------------------------------------------------
     # EventMixin: kayıt edildikten SONRA çalışır, warning modunda not ekler
     # ----------------------------------------------------------------------
+
+    TRACKED_EVENTS = {"build_build.created", "build_build.saved"}
+
     def process_event(self, event, *args, **kwargs):
         """
-        Build Order kaydedildikten sonra çalışır.
-        Warning modunda eksikler varsa Build Order'ın notes alanına yazar.
+        Build Order oluşturulduğunda veya güncellendiğinde çalışır.
+        Warning modunda eksikler varsa Build Order notunu yazar/günceller.
         """
-        # Sadece Build Order oluşturma event'i ile ilgileniyoruz
-        if event != "build_build.created":
+        if event not in self.TRACKED_EVENTS:
             return
 
         if not self.get_setting("CHECK_ENABLED"):
             return
 
-        # Sadece warning modunda not yaz
-        # Error modu zaten validation tarafında çalıştı, buraya zaten gelmedi (bloklandı)
         if self.get_setting("CHECK_MODE") != "warning":
             return
 
-        # Build Order'ı veritabanından çek (artık kayıtlı, pk var)
         build_id = kwargs.get("id")
         if not build_id:
             return
@@ -169,15 +266,11 @@ class MaterialCheckPlugin(ValidationMixin, SettingsMixin, EventMixin, InvenTreeP
             return
 
         shortages = self._calculate_shortages(instance)
+
         if not shortages:
-            logger.info(f"MaterialCheckPlugin: Build Order #{instance.pk} — tüm malzemeler yeterli.")
+            logger.info("MaterialCheckPlugin: Build Order #%s — tüm malzemeler yeterli.", instance.pk)
             return
 
-        # Eksik var, log'a yaz ve notes alanına ekle
         report = self._format_report(instance, shortages)
-        logger.warning(f"MaterialCheckPlugin (WARNING):\n{report}")
-
-        # Build Order'ın notes alanına raporu ekle
-        existing_notes = instance.notes or ""
-        instance.notes = existing_notes + "\n\n---\n" + report
-        instance.save(update_fields=["notes"])
+        logger.warning("MaterialCheckPlugin (WARNING):\n%s", report)
+        self._write_note(instance, report)
