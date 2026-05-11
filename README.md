@@ -114,7 +114,7 @@ shortage     = required - available
 
 ```bash
 git clone https://github.com/ovalriver23/Antsis_TestCase.git
-cd inventree-material-check
+cd Antsis_TestCase/inventree-material-check
 ```
 
 **2. `.env` dosyasını oluştur**
